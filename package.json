@@ -1,5 +1,5 @@
 {
-  "name": "ai-sdk-agents-universal-scraper-tool",
+  "name": "@nolly-studio/ai-sdk-agents-universal-scraper-tool",
   "version": "1.0.0",
   "description": "AI SDK Agents Universal Scraper Tool",
   "type": "module",
@@ -15,6 +15,13 @@
   "files": [
     "dist"
   ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nolly-studio/ai-sdk-agents-universal-scraper-tool.git"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
   "scripts": {
     "build": "tsup src/index.ts --format esm --dts",
     "test": "tsx --env-file=.env.local src/test.ts",
@@ -29,7 +36,7 @@
     "scraper",
     "web-scraping"
   ],
-  "author": "Jordan Gilliam",
+  "author": "Nolly Studio",
   "license": "ISC",
   "packageManager": "pnpm@10.8.0",
   "devDependencies": {
