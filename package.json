@@ -18,6 +18,7 @@
   "scripts": {
     "build": "tsup src/index.ts --format esm --dts",
     "test": "tsx --env-file=.env.local src/test.ts",
+    "test:crawler": "tsx --env-file=.env.local src/crawler-test.ts",
     "test:integration": "node --import tsx --test src/scraper.test.ts",
     "prepublishOnly": "pnpm build"
   },
@@ -43,11 +44,12 @@
   "dependencies": {
     "@mendable/firecrawl-js": "^4.5.0",
     "@mozilla/readability": "^0.6.0",
-    "ai": "^5.0.92",
+    "ai": "6.0.0-beta.99",
     "cheerio": "^1.1.2",
     "exa-js": "^2.0.3",
     "isomorphic-dompurify": "^2.32.0",
     "jsdom": "^27.2.0",
+    "p-map": "^7.0.4",
     "turndown": "^7.2.2",
     "zod": "^4.1.12"
   }

@@ -1,10 +1,10 @@
 /**
- * Unified scraping library
- * Simple, declarative API with great defaults
+ * Unified crawling library
+ * Simple, declarative API with great defaults for crawling multiple sites with subpage discovery
  *
  * @example
- * import { scrape } from '@/lib/scraping';
- * const result = await scrape('https://example.com');
+ * import { crawl } from '@/lib/crawler';
+ * const result = await crawl('https://example.com', { maxSubpages: 5 });
  */
 
 import Exa from "exa-js";
@@ -14,6 +14,7 @@ import TurndownService from "turndown";
 import { Readability } from "@mozilla/readability";
 import { JSDOM } from "jsdom";
 import DOMPurify from "isomorphic-dompurify";
+import pMap from "p-map";
 
 // ============================================================================
 // Types
@@ -63,8 +64,38 @@ export interface ScrapeResult {
   provider: ScrapingProvider;
 }
 
-export interface ScrapeBatchResult {
-  results: ScrapeResult[];
+export type CrawlingProvider = ScrapingProvider; // "exa" | "firecrawl" | "cheerio"
+
+export interface CrawlOptions extends Omit<ScrapeOptions, "provider"> {
+  /** Preferred provider to use (if available) */
+  provider?: CrawlingProvider;
+
+  /** Maximum number of subpages to crawl per page (default: 0) */
+  maxSubpages?: number;
+
+  /** Maximum crawl depth (default: 1) */
+  maxDepth?: number;
+
+  /** Keywords to find specific subpages (for Exa) */
+  subpageTarget?: string | string[];
+
+  /** Concurrent requests for Cheerio (default: 5) */
+  concurrency?: number;
+
+  /** Only follow same-domain links for Cheerio (default: true) */
+  sameDomainOnly?: boolean;
+}
+
+export interface CrawlResult extends ScrapeResult {
+  /** Array of discovered subpages */
+  subpages?: CrawlResult[];
+
+  /** Crawl depth of this page */
+  depth?: number;
+}
+
+export interface CrawlBatchResult {
+  results: CrawlResult[];
   statuses?: Array<{
     id: string;
     status: "success" | "error";
@@ -73,14 +104,14 @@ export interface ScrapeBatchResult {
 }
 
 // Internal types
-interface ProviderAdapter {
-  name: ScrapingProvider;
+interface CrawlerAdapter {
+  name: CrawlingProvider;
   available: () => boolean;
-  scrape: (url: string, options: ScrapeOptions) => Promise<ScrapeResult>;
-  scrapeBatch: (
+  crawl: (url: string, options: CrawlOptions) => Promise<CrawlResult>;
+  crawlBatch: (
     urls: string[],
-    options: ScrapeOptions
-  ) => Promise<ScrapeBatchResult>;
+    options: CrawlOptions
+  ) => Promise<CrawlBatchResult>;
 }
 
 // Error type with rate limit flag
@@ -88,7 +119,7 @@ interface RateLimitError extends Error {
   isRateLimit: boolean;
 }
 
-// Exa API types
+// Exa API types (reuse from scraper)
 interface ExaResult {
   url?: string;
   text?: string;
@@ -99,6 +130,7 @@ interface ExaResult {
   publishedDate?: string;
   image?: string;
   favicon?: string;
+  subpages?: ExaResult[];
   [key: string]: unknown;
 }
 
@@ -111,11 +143,9 @@ interface ExaStatus {
   };
 }
 
-// ExaOptions matches the Exa SDK's ContentsOptions type
-// Using Record<string, unknown> to be compatible with the SDK
 type ExaOptions = Record<string, unknown>;
 
-// Firecrawl API types
+// Firecrawl API types (reuse from scraper)
 interface FirecrawlMetadata {
   sourceURL?: string;
   title?: string;
@@ -131,6 +161,7 @@ interface FirecrawlResult {
   markdown?: string;
   html?: string;
   metadata?: FirecrawlMetadata;
+  links?: string[];
   [key: string]: unknown;
 }
 
@@ -139,11 +170,10 @@ interface FirecrawlResponse {
   markdown?: string;
   html?: string;
   metadata?: FirecrawlMetadata;
+  links?: string[];
   [key: string]: unknown;
 }
 
-// FirecrawlOptions matches the Firecrawl SDK's ScrapeOptions type
-// Using Record<string, unknown> to be compatible with the SDK
 type FirecrawlOptions = Record<string, unknown>;
 
 interface RateLimitState {
@@ -159,7 +189,7 @@ interface ProviderState {
 }
 
 // ============================================================================
-// Rate Limit State Management
+// Rate Limit State Management (reused from scraper)
 // ============================================================================
 
 const RATE_LIMIT_COOLDOWN_MS = 60 * 1000; // 1 minute
@@ -172,7 +202,7 @@ const createInitialState = (): ProviderState => ({
   },
 });
 
-const createRateLimitState = (): Record<ScrapingProvider, ProviderState> => ({
+const createRateLimitState = (): Record<CrawlingProvider, ProviderState> => ({
   exa: createInitialState(),
   firecrawl: createInitialState(),
   cheerio: createInitialState(),
@@ -180,17 +210,17 @@ const createRateLimitState = (): Record<ScrapingProvider, ProviderState> => ({
 
 const state = createRateLimitState();
 
-const setAvailable = (provider: ScrapingProvider, available: boolean): void => {
+const setAvailable = (provider: CrawlingProvider, available: boolean): void => {
   state[provider].available = available;
 };
 
-const recordSuccess = (provider: ScrapingProvider): void => {
+const recordSuccess = (provider: CrawlingProvider): void => {
   state[provider].lastSuccess = new Date();
   state[provider].rateLimit.isLimited = false;
   state[provider].rateLimit.errors = 0;
 };
 
-const recordRateLimit = (provider: ScrapingProvider): void => {
+const recordRateLimit = (provider: CrawlingProvider): void => {
   state[provider].rateLimit.isLimited = true;
   state[provider].rateLimit.errors += 1;
   state[provider].rateLimit.resetAt = new Date(
@@ -198,11 +228,11 @@ const recordRateLimit = (provider: ScrapingProvider): void => {
   );
 };
 
-const recordError = (provider: ScrapingProvider): void => {
+const recordError = (provider: CrawlingProvider): void => {
   state[provider].rateLimit.errors += 1;
 };
 
-const isRateLimited = (provider: ScrapingProvider): boolean => {
+const isRateLimited = (provider: CrawlingProvider): boolean => {
   const providerState = state[provider];
   if (!providerState.rateLimit.isLimited) return false;
 
@@ -218,9 +248,8 @@ const isRateLimited = (provider: ScrapingProvider): boolean => {
   return true;
 };
 
-const getAvailableProvidersInternal = (): ScrapingProvider[] => {
-  return (["exa", "firecrawl", "cheerio"] as ScrapingProvider[]).filter((p) => {
-    // Check availability dynamically by calling the adapter's available() method
+const getAvailableProvidersInternal = (): CrawlingProvider[] => {
+  return (["exa", "firecrawl", "cheerio"] as CrawlingProvider[]).filter((p) => {
     const adapter =
       p === "exa"
         ? exaAdapter
@@ -232,10 +261,10 @@ const getAvailableProvidersInternal = (): ScrapingProvider[] => {
 };
 
 const selectProvider = (
-  prefer?: ScrapingProvider,
+  prefer?: CrawlingProvider,
   fallback: boolean = true,
-  options?: ScrapeOptions
-): ScrapingProvider | null => {
+  options?: CrawlOptions
+): CrawlingProvider | null => {
   const available = getAvailableProvidersInternal();
 
   if (available.length === 0) return null;
@@ -250,7 +279,7 @@ const selectProvider = (
   if (prefer && !fallback) return null;
 
   // Default priority order: Cheerio > Exa > Firecrawl
-  const priorityOrder: ScrapingProvider[] = ["cheerio", "exa", "firecrawl"];
+  const priorityOrder: CrawlingProvider[] = ["cheerio", "exa", "firecrawl"];
 
   // First, try providers in priority order
   for (const provider of priorityOrder) {
@@ -275,62 +304,38 @@ const selectProvider = (
 };
 
 // ============================================================================
-// Exa Adapter
+// Helper Functions
 // ============================================================================
 
-const createExaClient = (): Exa | null => {
-  const apiKey = process.env.EXA_API_KEY;
-  if (!apiKey) return null;
-
-  try {
-    return new Exa(apiKey);
-  } catch {
-    return null;
-  }
-};
-
-const isExaRateLimitError = (error: unknown): boolean => {
-  const msg = error instanceof Error ? error.message : String(error);
-  return /rate limit|429|quota|limit/i.test(msg);
-};
-
-const normalizeExaResult = (
+const normalizeExaResultToCrawl = (
   result: ExaResult,
   url: string,
-  options?: ScrapeOptions
-): ScrapeResult => {
-  // Exa returns markdown in result.text when text: true (without includeHtmlTags)
-  // or HTML when includeHtmlTags: true
+  options: CrawlOptions,
+  depth: number = 0
+): CrawlResult => {
+  // Reuse normalization logic from scraper
   const exaText = result.text || "";
   const exaHtml = result.html || "";
 
-  // Check if text contains HTML tags (if it does, it's HTML, otherwise it's markdown)
   const isHtml = exaText.includes("<") && exaText.includes(">");
-
-  // Get HTML content (prefer html field, fallback to text if it's HTML)
   const htmlContent = exaHtml || (isHtml ? exaText : "");
 
-  // Get plain text (strip HTML tags if text contains HTML)
   let text = exaText;
   if (isHtml) {
     const dom = new JSDOM(exaText);
     text = dom.window.document.body.textContent || "";
   }
 
-  // Handle markdown: Exa returns markdown directly when text: true without includeHtmlTags
   let markdown: string | undefined;
-  if (options?.markdown !== false) {
+  if (options.markdown !== false) {
     if (!isHtml && exaText) {
-      // Exa already returned markdown, use it directly
       markdown = exaText;
     } else if (htmlContent) {
-      // Convert HTML to markdown
       const turndown = new TurndownService({
         headingStyle: "atx",
         codeBlockStyle: "fenced",
       });
 
-      // Sanitize HTML before converting to markdown
       const sanitizedHtml = DOMPurify.sanitize(htmlContent, {
         ALLOWED_TAGS: [
           "p",
@@ -379,22 +384,38 @@ const normalizeExaResult = (
       markdown = turndown.turndown(sanitizedHtml);
     }
 
-    // Truncate markdown if maxChars is set
-    if (markdown && options?.maxChars && markdown.length > options.maxChars) {
+    if (markdown && options.maxChars && markdown.length > options.maxChars) {
       markdown = markdown.substring(0, options.maxChars);
     }
   }
 
-  // Truncate text if maxChars is set
-  if (options?.maxChars && text.length > options.maxChars) {
+  if (options.maxChars && text.length > options.maxChars) {
     text = text.substring(0, options.maxChars);
+  }
+
+  // Process subpages recursively
+  const subpages: CrawlResult[] = [];
+  if (result.subpages && result.subpages.length > 0) {
+    const maxSubpages = options.maxSubpages || 0;
+    const subpagesToProcess = result.subpages.slice(0, maxSubpages);
+
+    for (const subpage of subpagesToProcess) {
+      subpages.push(
+        normalizeExaResultToCrawl(
+          subpage,
+          subpage.url || url,
+          options,
+          depth + 1
+        )
+      );
+    }
   }
 
   return {
     url: result.url || url,
     text,
     markdown,
-    html: options?.html ? htmlContent : undefined,
+    html: options.html ? htmlContent : undefined,
     metadata: {
       title: result.title ?? undefined,
       description: result.summary,
@@ -416,286 +437,23 @@ const normalizeExaResult = (
               "publishedDate",
               "image",
               "favicon",
+              "subpages",
             ].includes(key)
         )
       ) as Record<string, unknown>),
     },
     provider: "exa",
+    subpages: subpages.length > 0 ? subpages : undefined,
+    depth,
   };
 };
 
-const normalizeExaStatuses = (
-  statuses: ExaStatus[] | undefined
-): ScrapeBatchResult["statuses"] => {
-  if (!statuses) return undefined;
-  return statuses.map((s) => ({
-    id: s.id || "",
-    status: s.status === "success" ? "success" : "error",
-    error: s.error
-      ? {
-          tag: s.error.tag || "UNKNOWN_ERROR",
-          httpStatusCode: s.error.httpStatusCode,
-        }
-      : undefined,
-  }));
-};
-
-const buildExaOptions = (options: ScrapeOptions): ExaOptions => {
-  const exaOptions: ExaOptions = {
-    livecrawl: options.livecrawl || "fallback",
-  };
-
-  if (options.markdown !== false) {
-    if (options.maxChars || options.html !== undefined) {
-      exaOptions.text = {
-        maxCharacters: options.maxChars,
-        includeHtmlTags: options.html || false,
-      };
-    } else {
-      exaOptions.text = true;
-    }
-  }
-
-  return exaOptions;
-};
-
-const exaAdapter: ProviderAdapter = {
-  name: "exa",
-
-  available: () => {
-    const apiKey = process.env.EXA_API_KEY;
-    return !!apiKey;
-  },
-
-  scrape: async (
-    url: string,
-    options: ScrapeOptions
-  ): Promise<ScrapeResult> => {
-    const client = createExaClient();
-    if (!client) {
-      throw new Error("Exa not available: EXA_API_KEY not set");
-    }
-
-    try {
-      const exaOptions = buildExaOptions(options);
-      const response = await client.getContents([url], exaOptions);
-
-      if (!response.results?.[0]) {
-        throw new Error(`No results from Exa for: ${url}`);
-      }
-
-      return normalizeExaResult(response.results[0], url, options);
-    } catch (error) {
-      if (isExaRateLimitError(error)) {
-        const err = new Error(
-          `Exa rate limit: ${
-            error instanceof Error ? error.message : String(error)
-          }`
-        );
-        (err as RateLimitError).isRateLimit = true;
-        throw err;
-      }
-      throw error;
-    }
-  },
-
-  scrapeBatch: async (
-    urls: string[],
-    options: ScrapeOptions
-  ): Promise<ScrapeBatchResult> => {
-    const client = createExaClient();
-    if (!client) {
-      throw new Error("Exa not available: EXA_API_KEY not set");
-    }
-
-    try {
-      const exaOptions = buildExaOptions(options);
-      const response = await client.getContents(urls, exaOptions);
-
-      const results = (response.results || []).map((r: ExaResult) =>
-        normalizeExaResult(r, (r.url || "") as string, options)
-      );
-
-      return {
-        results,
-        statuses: normalizeExaStatuses(response.statuses),
-      };
-    } catch (error) {
-      if (isExaRateLimitError(error)) {
-        const err = new Error(
-          `Exa rate limit: ${
-            error instanceof Error ? error.message : String(error)
-          }`
-        );
-        (err as RateLimitError).isRateLimit = true;
-        throw err;
-      }
-      throw error;
-    }
-  },
-};
-
-// ============================================================================
-// Firecrawl Adapter
-// ============================================================================
-
-const createFirecrawlClient = (): Firecrawl | null => {
-  const apiKey = process.env.FIRECRAWL_API_KEY || process.env.FC_API_KEY;
-  if (!apiKey) return null;
-
-  try {
-    return new Firecrawl({ apiKey });
-  } catch {
-    return null;
-  }
-};
-
-const isFirecrawlRateLimitError = (error: unknown): boolean => {
-  const msg = error instanceof Error ? error.message : String(error);
-  return /rate limit|429|quota|limit|RateLimitError/i.test(msg);
-};
-
-const normalizeFirecrawlResult = (
-  data: FirecrawlResult,
-  url: string
-): ScrapeResult => ({
-  url: data.metadata?.sourceURL || url,
-  markdown: data.markdown,
-  html: data.html,
-  text: data.markdown || data.html || "",
-  metadata: {
-    title: data.metadata?.title,
-    description: data.metadata?.description,
-    language: data.metadata?.language,
-    keywords: data.metadata?.keywords,
-    image: data.metadata?.ogImage,
-    statusCode: data.metadata?.statusCode,
-    sourceURL: data.metadata?.sourceURL || url,
-    ...data.metadata,
-  },
-  provider: "firecrawl",
-});
-
-const buildFirecrawlOptions = (options: ScrapeOptions): FirecrawlOptions => {
-  const formats: string[] = [];
-
-  if (options.markdown !== false) formats.push("markdown");
-  if (options.html) formats.push("html");
-  if (formats.length === 0) formats.push("markdown");
-
-  const firecrawlOptions: FirecrawlOptions = {
-    formats: formats as unknown as string[],
-  };
-
-  if (options.maxAge !== undefined) firecrawlOptions.maxAge = options.maxAge;
-  if (options.maxAge === 0) firecrawlOptions.storeInCache = false;
-
-  return firecrawlOptions;
-};
-
-const firecrawlAdapter: ProviderAdapter = {
-  name: "firecrawl",
-
-  available: () => {
-    const apiKey = process.env.FIRECRAWL_API_KEY || process.env.FC_API_KEY;
-    return !!apiKey;
-  },
-
-  scrape: async (
-    url: string,
-    options: ScrapeOptions
-  ): Promise<ScrapeResult> => {
-    const client = createFirecrawlClient();
-    if (!client) {
-      throw new Error("Firecrawl not available: FIRECRAWL_API_KEY not set");
-    }
-
-    try {
-      const firecrawlOptions = buildFirecrawlOptions(options);
-      const response = await client.scrape(url, firecrawlOptions);
-
-      // Firecrawl SDK returns response with data property, but types may not reflect this
-      const firecrawlResponse = response as FirecrawlResponse;
-      const data: FirecrawlResult =
-        firecrawlResponse.data ||
-        ({
-          markdown: firecrawlResponse.markdown,
-          html: firecrawlResponse.html,
-          metadata: firecrawlResponse.metadata,
-        } as FirecrawlResult);
-
-      if (!data) {
-        throw new Error(`No data from Firecrawl for: ${url}`);
-      }
-
-      return normalizeFirecrawlResult(data, url);
-    } catch (error) {
-      if (isFirecrawlRateLimitError(error)) {
-        const err = new Error(
-          `Firecrawl rate limit: ${
-            error instanceof Error ? error.message : String(error)
-          }`
-        );
-        (err as RateLimitError).isRateLimit = true;
-        throw err;
-      }
-      throw error;
-    }
-  },
-
-  scrapeBatch: async (
-    urls: string[],
-    options: ScrapeOptions
-  ): Promise<ScrapeBatchResult> => {
-    const client = createFirecrawlClient();
-    if (!client) {
-      throw new Error("Firecrawl not available: FIRECRAWL_API_KEY not set");
-    }
-
-    const results: ScrapeResult[] = [];
-    const statuses: ScrapeBatchResult["statuses"] = [];
-
-    for (const url of urls) {
-      try {
-        const result = await firecrawlAdapter.scrape(url, options);
-        results.push(result);
-        statuses?.push({ id: url, status: "success" });
-      } catch (error) {
-        const msg = error instanceof Error ? error.message : String(error);
-        statuses?.push({
-          id: url,
-          status: "error",
-          error: {
-            tag: "CRAWL_ERROR",
-            httpStatusCode: /404/.test(msg)
-              ? 404
-              : /403/.test(msg)
-              ? 403
-              : undefined,
-          },
-        });
-      }
-    }
-
-    return { results, statuses };
-  },
-};
-
-// ============================================================================
-// Cheerio Adapter
-// ============================================================================
-
-// Initialize turndown service for HTML to markdown conversion
-const turndownService = new TurndownService({
-  headingStyle: "atx",
-  codeBlockStyle: "fenced",
-});
-
-const normalizeCheerioResult = (
+const normalizeCheerioResultToCrawl = (
   html: string,
   url: string,
-  options: ScrapeOptions
-): ScrapeResult => {
+  options: CrawlOptions,
+  depth: number = 0
+): CrawlResult => {
   const dom = new JSDOM(html, { url });
   const document = dom.window.document;
   const reader = new Readability(document);
@@ -705,7 +463,6 @@ const normalizeCheerioResult = (
     throw new Error(`Failed to parse readable content from: ${url}`);
   }
 
-  // Extract metadata using cheerio
   const $ = cheerio.load(html);
   const title =
     article.title ||
@@ -734,12 +491,9 @@ const normalizeCheerioResult = (
     $('link[rel="shortcut icon"]').attr("href") ||
     "";
 
-  // Get HTML content
   let htmlContent = article.content || html;
 
-  // Sanitize HTML content to prevent XSS attacks
   htmlContent = DOMPurify.sanitize(htmlContent, {
-    // Allow common HTML elements for readable content
     ALLOWED_TAGS: [
       "p",
       "br",
@@ -782,23 +536,24 @@ const normalizeCheerioResult = (
       "height",
       "align",
     ],
-    // Keep relative URLs safe
     ALLOW_DATA_ATTR: false,
   });
 
-  // Convert HTML to markdown if markdown is requested
+  const turndownService = new TurndownService({
+    headingStyle: "atx",
+    codeBlockStyle: "fenced",
+  });
+
   let markdown: string | undefined;
   if (options.markdown !== false) {
     markdown = turndownService.turndown(htmlContent);
   }
 
-  // Get text content (strip HTML tags)
   let text = article.textContent || "";
   if (options.maxChars && text.length > options.maxChars) {
     text = text.substring(0, options.maxChars);
   }
 
-  // Truncate markdown if maxChars is set
   if (markdown && options.maxChars && markdown.length > options.maxChars) {
     markdown = markdown.substring(0, options.maxChars);
   }
@@ -821,73 +576,343 @@ const normalizeCheerioResult = (
       sourceURL: url,
     },
     provider: "cheerio",
+    depth,
   };
 };
 
-const cheerioAdapter: ProviderAdapter = {
-  name: "cheerio",
+const extractLinks = (
+  html: string,
+  baseUrl: string,
+  sameDomainOnly: boolean = true
+): string[] => {
+  const $ = cheerio.load(html);
+  const links: string[] = [];
+  const baseDomain = new URL(baseUrl).hostname;
 
-  available: () => {
-    // Cheerio is always available (no API key needed)
-    return true;
-  },
+  $("a[href]").each((_, element) => {
+    const href = $(element).attr("href");
+    if (!href || href.startsWith("#") || href.startsWith("mailto:")) {
+      return;
+    }
 
-  scrape: async (
-    url: string,
-    options: ScrapeOptions
-  ): Promise<ScrapeResult> => {
     try {
-      // Validate URL
-      new URL(url);
+      const absoluteUrl = new URL(href, baseUrl).href;
+      const urlDomain = new URL(absoluteUrl).hostname;
 
-      // Fetch HTML content
-      const response = await fetch(url, {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        },
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status} for ${url}`);
+      if (sameDomainOnly && urlDomain !== baseDomain) {
+        return;
       }
 
-      const html = await response.text();
+      // Only include http/https URLs
+      if (
+        absoluteUrl.startsWith("http://") ||
+        absoluteUrl.startsWith("https://")
+      ) {
+        links.push(absoluteUrl);
+      }
+    } catch {
+      // Invalid URL, skip
+    }
+  });
 
-      return normalizeCheerioResult(html, url, options);
+  // Deduplicate
+  return Array.from(new Set(links));
+};
+
+// ============================================================================
+// Exa Adapter
+// ============================================================================
+
+const createExaClient = (): Exa | null => {
+  const apiKey = process.env.EXA_API_KEY;
+  if (!apiKey) return null;
+
+  try {
+    return new Exa(apiKey);
+  } catch {
+    return null;
+  }
+};
+
+const isExaRateLimitError = (error: unknown): boolean => {
+  const msg = error instanceof Error ? error.message : String(error);
+  return /rate limit|429|quota|limit/i.test(msg);
+};
+
+const buildExaOptions = (options: CrawlOptions): ExaOptions => {
+  const exaOptions: ExaOptions = {
+    livecrawl: options.livecrawl || "fallback",
+  };
+
+  if (options.markdown !== false) {
+    if (options.maxChars || options.html !== undefined) {
+      exaOptions.text = {
+        maxCharacters: options.maxChars,
+        includeHtmlTags: options.html || false,
+      };
+    } else {
+      exaOptions.text = true;
+    }
+  }
+
+  // Add subpages support
+  if (options.maxSubpages && options.maxSubpages > 0) {
+    exaOptions.subpages = options.maxSubpages;
+
+    if (options.subpageTarget) {
+      exaOptions.subpageTarget = Array.isArray(options.subpageTarget)
+        ? options.subpageTarget.join(",")
+        : options.subpageTarget;
+    }
+  }
+
+  return exaOptions;
+};
+
+const exaAdapter: CrawlerAdapter = {
+  name: "exa",
+
+  available: () => {
+    const apiKey = process.env.EXA_API_KEY;
+    return !!apiKey;
+  },
+
+  crawl: async (url: string, options: CrawlOptions): Promise<CrawlResult> => {
+    const client = createExaClient();
+    if (!client) {
+      throw new Error("Exa not available: EXA_API_KEY not set");
+    }
+
+    try {
+      const exaOptions = buildExaOptions(options);
+      const response = await client.getContents([url], exaOptions);
+
+      if (!response.results?.[0]) {
+        throw new Error(`No results from Exa for: ${url}`);
+      }
+
+      return normalizeExaResultToCrawl(response.results[0], url, options, 0);
     } catch (error) {
-      if (error instanceof TypeError && error.message.includes("Invalid URL")) {
-        throw new Error(`Invalid URL: ${url}`);
+      if (isExaRateLimitError(error)) {
+        const err = new Error(
+          `Exa rate limit: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+        (err as RateLimitError).isRateLimit = true;
+        throw err;
       }
       throw error;
     }
   },
 
-  scrapeBatch: async (
+  crawlBatch: async (
     urls: string[],
-    options: ScrapeOptions
-  ): Promise<ScrapeBatchResult> => {
-    const results: ScrapeResult[] = [];
-    const statuses: ScrapeBatchResult["statuses"] = [];
+    options: CrawlOptions
+  ): Promise<CrawlBatchResult> => {
+    const client = createExaClient();
+    if (!client) {
+      throw new Error("Exa not available: EXA_API_KEY not set");
+    }
+
+    try {
+      const exaOptions = buildExaOptions(options);
+      const response = await client.getContents(urls, exaOptions);
+
+      const results: CrawlResult[] = [];
+      for (const r of response.results || []) {
+        results.push(
+          normalizeExaResultToCrawl(r, (r.url || "") as string, options, 0)
+        );
+      }
+
+      const statuses: CrawlBatchResult["statuses"] = (
+        response.statuses || []
+      ).map((s: ExaStatus) => ({
+        id: s.id || "",
+        status: (s.status === "success" ? "success" : "error") as
+          | "success"
+          | "error",
+        error: s.error
+          ? {
+              tag: s.error.tag || "UNKNOWN_ERROR",
+              httpStatusCode: s.error.httpStatusCode,
+            }
+          : undefined,
+      }));
+
+      return { results, statuses };
+    } catch (error) {
+      if (isExaRateLimitError(error)) {
+        const err = new Error(
+          `Exa rate limit: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+        (err as RateLimitError).isRateLimit = true;
+        throw err;
+      }
+      throw error;
+    }
+  },
+};
+
+// ============================================================================
+// Firecrawl Adapter
+// ============================================================================
+
+const createFirecrawlClient = (): Firecrawl | null => {
+  const apiKey = process.env.FIRECRAWL_API_KEY || process.env.FC_API_KEY;
+  if (!apiKey) return null;
+
+  try {
+    return new Firecrawl({ apiKey });
+  } catch {
+    return null;
+  }
+};
+
+const isFirecrawlRateLimitError = (error: unknown): boolean => {
+  const msg = error instanceof Error ? error.message : String(error);
+  return /rate limit|429|quota|limit|RateLimitError/i.test(msg);
+};
+
+const normalizeFirecrawlResultToCrawl = (
+  data: FirecrawlResult,
+  url: string,
+  depth: number = 0
+): CrawlResult => ({
+  url: data.metadata?.sourceURL || url,
+  markdown: data.markdown,
+  html: data.html,
+  text: data.markdown || data.html || "",
+  metadata: {
+    title: data.metadata?.title,
+    description: data.metadata?.description,
+    language: data.metadata?.language,
+    keywords: data.metadata?.keywords,
+    image: data.metadata?.ogImage,
+    statusCode: data.metadata?.statusCode,
+    sourceURL: data.metadata?.sourceURL || url,
+    ...data.metadata,
+  },
+  provider: "firecrawl",
+  depth,
+});
+
+const buildFirecrawlOptions = (options: CrawlOptions): FirecrawlOptions => {
+  const formats: string[] = [];
+
+  if (options.markdown !== false) formats.push("markdown");
+  if (options.html) formats.push("html");
+  if (formats.length === 0) formats.push("markdown");
+
+  const firecrawlOptions: FirecrawlOptions = {
+    formats: formats as unknown as string[],
+  };
+
+  if (options.maxAge !== undefined) firecrawlOptions.maxAge = options.maxAge;
+  if (options.maxAge === 0) firecrawlOptions.storeInCache = false;
+
+  return firecrawlOptions;
+};
+
+const firecrawlAdapter: CrawlerAdapter = {
+  name: "firecrawl",
+
+  available: () => {
+    const apiKey = process.env.FIRECRAWL_API_KEY || process.env.FC_API_KEY;
+    return !!apiKey;
+  },
+
+  crawl: async (url: string, options: CrawlOptions): Promise<CrawlResult> => {
+    const client = createFirecrawlClient();
+    if (!client) {
+      throw new Error("Firecrawl not available: FIRECRAWL_API_KEY not set");
+    }
+
+    try {
+      const firecrawlOptions = buildFirecrawlOptions(options);
+      const response = await client.scrape(url, firecrawlOptions);
+
+      const firecrawlResponse = response as FirecrawlResponse;
+      const data: FirecrawlResult =
+        firecrawlResponse.data ||
+        ({
+          markdown: firecrawlResponse.markdown,
+          html: firecrawlResponse.html,
+          metadata: firecrawlResponse.metadata,
+          links: firecrawlResponse.links,
+        } as FirecrawlResult);
+
+      if (!data) {
+        throw new Error(`No data from Firecrawl for: ${url}`);
+      }
+
+      const result = normalizeFirecrawlResultToCrawl(data, url, 0);
+
+      // If subpages are requested, crawl them using Cheerio adapter
+      if (options.maxSubpages && options.maxSubpages > 0 && data.links) {
+        const maxSubpages = Math.min(options.maxSubpages, data.links.length);
+        const subpageUrls = data.links.slice(0, maxSubpages);
+
+        // Use cheerio adapter to crawl subpages
+        const subpageResults = await cheerioAdapter.crawlBatch(subpageUrls, {
+          ...options,
+          maxSubpages: 0,
+          maxDepth: (options.maxDepth || 1) - 1,
+        });
+
+        result.subpages = subpageResults.results.map((r) => ({
+          ...r,
+          depth: (r.depth || 0) + 1,
+        }));
+      }
+
+      return result;
+    } catch (error) {
+      if (isFirecrawlRateLimitError(error)) {
+        const err = new Error(
+          `Firecrawl rate limit: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+        (err as RateLimitError).isRateLimit = true;
+        throw err;
+      }
+      throw error;
+    }
+  },
+
+  crawlBatch: async (
+    urls: string[],
+    options: CrawlOptions
+  ): Promise<CrawlBatchResult> => {
+    const client = createFirecrawlClient();
+    if (!client) {
+      throw new Error("Firecrawl not available: FIRECRAWL_API_KEY not set");
+    }
+
+    const results: CrawlResult[] = [];
+    const statuses: CrawlBatchResult["statuses"] = [];
 
     for (const url of urls) {
       try {
-        const result = await cheerioAdapter.scrape(url, options);
+        const result = await firecrawlAdapter.crawl(url, options);
         results.push(result);
         statuses?.push({ id: url, status: "success" });
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
-        const httpStatusCode = /404/.test(msg)
-          ? 404
-          : /403/.test(msg)
-          ? 403
-          : undefined;
         statuses?.push({
           id: url,
           status: "error",
           error: {
             tag: "CRAWL_ERROR",
-            httpStatusCode,
+            httpStatusCode: /404/.test(msg)
+              ? 404
+              : /403/.test(msg)
+              ? 403
+              : undefined,
           },
         });
       }
@@ -898,14 +923,155 @@ const cheerioAdapter: ProviderAdapter = {
 };
 
 // ============================================================================
-// Main Scraper Logic
+// Cheerio Adapter
 // ============================================================================
 
-// Default options - great defaults, no configuration needed
-const DEFAULT_OPTIONS: Partial<ScrapeOptions> = {
+const cheerioAdapter: CrawlerAdapter = {
+  name: "cheerio",
+
+  available: () => {
+    return true;
+  },
+
+  crawl: async (url: string, options: CrawlOptions): Promise<CrawlResult> => {
+    const visitedUrls = new Set<string>();
+    const concurrency = options.concurrency || 5;
+    const maxDepth = options.maxDepth ?? 1;
+    const maxSubpages = options.maxSubpages || 0;
+    const sameDomainOnly = options.sameDomainOnly !== false;
+
+    const crawlRecursive = async (
+      currentUrl: string,
+      depth: number
+    ): Promise<CrawlResult> => {
+      if (visitedUrls.has(currentUrl) || depth > maxDepth) {
+        throw new Error(
+          `URL already visited or max depth reached: ${currentUrl}`
+        );
+      }
+
+      visitedUrls.add(currentUrl);
+
+      try {
+        new URL(currentUrl);
+      } catch {
+        throw new Error(`Invalid URL: ${currentUrl}`);
+      }
+
+      const response = await fetch(currentUrl, {
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error(
+          `HTTP error! status: ${response.status} for ${currentUrl}`
+        );
+      }
+
+      const html = await response.text();
+      const result = normalizeCheerioResultToCrawl(
+        html,
+        currentUrl,
+        options,
+        depth
+      );
+
+      // Discover and crawl subpages if requested
+      if (depth < maxDepth && maxSubpages > 0) {
+        const links = extractLinks(html, currentUrl, sameDomainOnly);
+        const linksToCrawl = links
+          .filter((link) => !visitedUrls.has(link))
+          .slice(0, maxSubpages);
+
+        if (linksToCrawl.length > 0) {
+          const subpageResults = await pMap(
+            linksToCrawl,
+            async (link) => {
+              try {
+                return await crawlRecursive(link, depth + 1);
+              } catch {
+                return null;
+              }
+            },
+            { concurrency }
+          );
+
+          result.subpages = subpageResults.filter(
+            (r): r is CrawlResult => r !== null
+          );
+        }
+      }
+
+      return result;
+    };
+
+    return crawlRecursive(url, 0);
+  },
+
+  crawlBatch: async (
+    urls: string[],
+    options: CrawlOptions
+  ): Promise<CrawlBatchResult> => {
+    const concurrency = options.concurrency || 5;
+    const results: CrawlResult[] = [];
+    const statuses: CrawlBatchResult["statuses"] = [];
+
+    const crawlResults = await pMap(
+      urls,
+      async (url) => {
+        try {
+          const result = await cheerioAdapter.crawl(url, options);
+          return { result, status: "success" as const, url };
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          return {
+            result: null,
+            status: "error" as const,
+            url,
+            error: {
+              tag: "CRAWL_ERROR",
+              httpStatusCode: /404/.test(msg)
+                ? 404
+                : /403/.test(msg)
+                ? 403
+                : undefined,
+            },
+          };
+        }
+      },
+      { concurrency }
+    );
+
+    for (const item of crawlResults) {
+      if (item.result) {
+        results.push(item.result);
+      }
+      statuses.push({
+        id: item.url,
+        status: item.status,
+        error: "error" in item ? item.error : undefined,
+      });
+    }
+
+    return { results, statuses };
+  },
+};
+
+// ============================================================================
+// Main Crawler Logic
+// ============================================================================
+
+const DEFAULT_OPTIONS: Partial<CrawlOptions> = {
   fallback: true,
   markdown: true,
   html: false,
+  maxSubpages: 0,
+  maxDepth: 1,
+  concurrency: 5,
+  sameDomainOnly: true,
 };
 
 const adapters = {
@@ -914,7 +1080,6 @@ const adapters = {
   cheerio: cheerioAdapter,
 };
 
-// Initialize provider availability
 const initProviders = () => {
   setAvailable("exa", exaAdapter.available());
   setAvailable("firecrawl", firecrawlAdapter.available());
@@ -923,17 +1088,17 @@ const initProviders = () => {
 
 initProviders();
 
-const getAdapter = (provider: ScrapingProvider) => adapters[provider];
+const getAdapter = (provider: CrawlingProvider) => adapters[provider];
 
 const tryWithFallback = async (
   url: string,
-  options: ScrapeOptions,
-  provider: ScrapingProvider
-): Promise<ScrapeResult> => {
+  options: CrawlOptions,
+  provider: CrawlingProvider
+): Promise<CrawlResult> => {
   const adapter = getAdapter(provider);
 
   try {
-    const result = await adapter.scrape(url, options);
+    const result = await adapter.crawl(url, options);
     recordSuccess(provider);
     return result;
   } catch (error) {
@@ -943,8 +1108,7 @@ const tryWithFallback = async (
       recordRateLimit(provider);
 
       if (options.fallback !== false) {
-        // Try alternative providers in order of preference
-        const alternatives: ScrapingProvider[] =
+        const alternatives: CrawlingProvider[] =
           provider === "exa"
             ? ["firecrawl", "cheerio"]
             : provider === "firecrawl"
@@ -955,7 +1119,7 @@ const tryWithFallback = async (
           const altAdapter = getAdapter(alt);
           if (altAdapter.available() && !isRateLimited(alt)) {
             try {
-              const result = await altAdapter.scrape(url, options);
+              const result = await altAdapter.crawl(url, options);
               recordSuccess(alt);
               return result;
             } catch (fallbackError) {
@@ -966,7 +1130,6 @@ const tryWithFallback = async (
               } else {
                 recordError(alt);
               }
-              // Continue to next alternative
             }
           }
         }
@@ -981,17 +1144,17 @@ const tryWithFallback = async (
 };
 
 /**
- * Scrape a URL
+ * Crawl a URL with subpage discovery
  * Simple API: just pass a URL, everything else has great defaults
  *
  * @example
- * const result = await scrape("https://example.com");
- * console.log(result.text);
+ * const result = await crawl("https://example.com", { maxSubpages: 5 });
+ * console.log(result.subpages);
  */
-export const scrape = async (
+export const crawl = async (
   url: string,
-  options: ScrapeOptions = {}
-): Promise<ScrapeResult> => {
+  options: CrawlOptions = {}
+): Promise<CrawlResult> => {
   const opts = { ...DEFAULT_OPTIONS, ...options };
 
   const provider = selectProvider(opts.provider, opts.fallback !== false, opts);
@@ -999,15 +1162,14 @@ export const scrape = async (
   if (!provider) {
     const exaAvail = exaAdapter.available();
     const fcAvail = firecrawlAdapter.available();
-
     const cheerioAvail = cheerioAdapter.available();
+
     if (!exaAvail && !fcAvail && !cheerioAvail) {
       throw new Error(
-        "No scraping providers available. Set EXA_API_KEY or FIRECRAWL_API_KEY, or use cheerio provider"
+        "No crawling providers available. Set EXA_API_KEY or FIRECRAWL_API_KEY, or use cheerio provider"
       );
     }
 
-    // Try anyway if fallback enabled
     if (opts.fallback !== false) {
       const tryProvider =
         opts.provider ||
@@ -1024,15 +1186,15 @@ export const scrape = async (
 };
 
 /**
- * Scrape multiple URLs
+ * Crawl multiple URLs with subpage discovery
  *
  * @example
- * const results = await scrapeBatch(["https://example.com", "https://example.org"]);
+ * const results = await crawlBatch(["https://example.com", "https://example.org"], { maxSubpages: 3 });
  */
-export const scrapeBatch = async (
+export const crawlBatch = async (
   urls: string[],
-  options: ScrapeOptions = {}
-): Promise<ScrapeBatchResult> => {
+  options: CrawlOptions = {}
+): Promise<CrawlBatchResult> => {
   const opts = { ...DEFAULT_OPTIONS, ...options };
 
   const provider = selectProvider(opts.provider, opts.fallback !== false, opts);
@@ -1044,7 +1206,7 @@ export const scrapeBatch = async (
 
     if (!exaAvail && !fcAvail && !cheerioAvail) {
       throw new Error(
-        "No scraping providers available. Set EXA_API_KEY or FIRECRAWL_API_KEY, or use cheerio provider"
+        "No crawling providers available. Set EXA_API_KEY or FIRECRAWL_API_KEY, or use cheerio provider"
       );
     }
 
@@ -1053,7 +1215,7 @@ export const scrapeBatch = async (
         opts.provider ||
         (cheerioAvail ? "cheerio" : exaAvail ? "exa" : "firecrawl");
       const adapter = getAdapter(tryProvider);
-      return adapter.scrapeBatch(urls, opts);
+      return adapter.crawlBatch(urls, opts);
     }
 
     throw new Error(
@@ -1064,7 +1226,7 @@ export const scrapeBatch = async (
   const adapter = getAdapter(provider);
 
   try {
-    const result = await adapter.scrapeBatch(urls, opts);
+    const result = await adapter.crawlBatch(urls, opts);
     recordSuccess(provider);
     return result;
   } catch (error) {
@@ -1072,8 +1234,7 @@ export const scrapeBatch = async (
 
     if (isRateLimit && opts.fallback !== false) {
       recordRateLimit(provider);
-      // Try alternative providers in order of preference
-      const alternatives: ScrapingProvider[] =
+      const alternatives: CrawlingProvider[] =
         provider === "exa"
           ? ["firecrawl", "cheerio"]
           : provider === "firecrawl"
@@ -1084,7 +1245,7 @@ export const scrapeBatch = async (
         const altAdapter = getAdapter(alt);
         if (altAdapter.available() && !isRateLimited(alt)) {
           try {
-            const result = await altAdapter.scrapeBatch(urls, opts);
+            const result = await altAdapter.crawlBatch(urls, opts);
             recordSuccess(alt);
             return result;
           } catch (fallbackError) {
@@ -1095,7 +1256,6 @@ export const scrapeBatch = async (
             } else {
               recordError(alt);
             }
-            // Continue to next alternative
           }
         }
       }
@@ -1110,8 +1270,8 @@ export const scrapeBatch = async (
 };
 
 /**
- * Get available providers
+ * Get available crawling providers
  */
-export const getAvailableProviders = (): ScrapingProvider[] => {
+export const getAvailableCrawlingProviders = (): CrawlingProvider[] => {
   return getAvailableProvidersInternal();
 };
