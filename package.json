@@ -1,0 +1,54 @@
+{
+  "name": "ai-sdk-agents-universal-scraper-tool",
+  "version": "1.0.0",
+  "description": "AI SDK Agents Universal Scraper Tool",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts",
+    "test": "tsx --env-file=.env.local src/test.ts",
+    "test:integration": "node --import tsx --test src/scraper.test.ts",
+    "prepublishOnly": "pnpm build"
+  },
+  "keywords": [
+    "ai",
+    "ai-sdk",
+    "tools",
+    "scraper",
+    "web-scraping"
+  ],
+  "author": "Jordan Gilliam",
+  "license": "ISC",
+  "packageManager": "pnpm@10.8.0",
+  "devDependencies": {
+    "@types/jsdom": "^27.0.0",
+    "@types/node": "^24.10.1",
+    "@types/turndown": "^5.0.6",
+    "dotenv": "^17.2.3",
+    "tsup": "^8.5.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@mendable/firecrawl-js": "^4.5.0",
+    "@mozilla/readability": "^0.6.0",
+    "ai": "^5.0.92",
+    "cheerio": "^1.1.2",
+    "exa-js": "^2.0.3",
+    "isomorphic-dompurify": "^2.32.0",
+    "jsdom": "^27.2.0",
+    "turndown": "^7.2.2",
+    "zod": "^4.1.12"
+  }
+}
